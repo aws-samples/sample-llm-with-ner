@@ -1,0 +1,38 @@
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  Env:
+    Type: String
+    Description: Environment Name. Limit the name to characters
+    Default: dev
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for notifications
+    Default: your-default@email.com
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+Resources:
+  DataStack:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location: cfn_templates/data.yaml
+      Parameters:
+        Env: !Ref Env
+
+  GenAiStack:
+    Type: AWS::Serverless::Application
+    DependsOn: DataStack
+    Properties:
+      Location: cfn_templates/sm_gen_ai.yaml
+      Parameters:
+        Env: !Ref Env
+        DocumentStateTable: !GetAtt DataStack.Outputs.DocumentStateTable
+        ExtractsBucket: !GetAtt DataStack.Outputs.ExtractsBucket
+        ExtractiveSummaryBucket: !GetAtt DataStack.Outputs.ExtractiveSummaryBucket
+        AbstractiveSummaryBucket: !GetAtt DataStack.Outputs.AbstractiveSummaryBucket
+        GeneratedTitleBucket: !GetAtt DataStack.Outputs.GeneratedTitleBucket
+        AuthorExtractionBucket: !GetAtt DataStack.Outputs.AuthorExtractionBucket
+        ModelsBucket: !GetAtt DataStack.Outputs.ModelsBucket
+        NotificationEmail: !Ref NotificationEmail

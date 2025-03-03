@@ -1,0 +1,1705 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Gen-ai stack for document processing
+
+Parameters:
+  LlmModelName:
+    Description: Sagemaker LLM Model name
+    Type: String
+    Default: llm-model
+
+  NerModelName:
+    Description: Sagemaker NER Model name
+    Type: String
+    Default: ner-model
+
+  LlmEndpointName:
+    Description: Sagemaker LLM Endpoint name
+    Type: String
+    Default: llm-endpoint
+
+  NerEndpointName:
+    Description: Sagemaker NER Endpoint name
+    Type: String
+    Default: ner-endpoint
+
+  LlmEndpointConfigName:
+    Description: Sagemaker LLM Endpoint config name
+    Type: String
+    Default: llm-endpoint-config
+
+  NerEndpointConfigName:
+    Description: Sagemaker LLM Endpoint config name
+    Type: String
+    Default: ner-endpoint-config
+
+  MaxConcurrentStateMachines:
+    Description: Max number of concurrent GenAI State Machines
+    Type: Number
+    Default: 100
+
+  Env:
+    Type: String
+    Description: Environment Name
+    Default: dev
+
+  RolePrefix:
+    Type: String
+    Description: Role Prefix
+    Default: User_Roles
+
+  PolicyPrefix:
+    Type: String
+    Description: Policy Prefix
+    Default: User_Policies
+
+  DocumentStateTable:
+    Type: String
+    Description: ARN of the DDB that keeps document state
+
+  DlcAccountsByRegion:
+    Description: DLC accounts by region for huggingface and pytorch images. These images are maintained by AWS and does not require permission to be accessed.
+    Type: String
+    Default: >
+      {
+        "us-gov-west-1": 442386744353, 
+        "us-east-1": 763104351884
+      }
+
+  ModelImages:
+    Description: Images used by the model endpoints
+    Type: String
+    Default: >
+      {
+        "llm": "huggingface-pytorch-tgi-inference:2.3-tgi2.2-gpu-py310-cu121-ubuntu22.04",
+        "ner": "huggingface-pytorch-inference:2.1.0-transformers4.37.0-cpu-py310-ubuntu22.04"
+      }
+
+  ModelInstanceTypes:
+    Description: Instance types used by the LLM
+    Type: String
+    Default: > 
+      {
+        "llm": "ml.p4d.24xlarge", 
+        "ner": "ml.c5.9xlarge"
+      }
+
+  ModelS3Paths:
+    Description: Sagemaker LLM model file path in S3
+    Type: String
+    Default: >
+      {
+        "llm": "llm-model.tar.gz", 
+        "ner": "ner-model.tar.gz"
+      }
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  ExtractsBucket:
+    Type: String
+
+  ExtractiveSummaryBucket:
+    Type: String
+
+  AbstractiveSummaryBucket:
+    Type: String
+
+  GeneratedTitleBucket:
+    Type: String
+
+  AuthorExtractionBucket:
+    Type: String
+
+  ModelsBucket:
+    Type: String
+
+
+Resources:
+
+
+###################################
+#
+# Networking Definitions
+#
+###################################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${Env}-GenAI-VPC
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub ${Env}-GenAI-Private-Subnet-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub ${Env}-GenAI-Private-Subnet-2
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${Env}-GenAI-Private-RT
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${Env}-GenAI-IGW
+
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs "" ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${Env}-GenAI-Public-Subnet-1
+
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+    DependsOn: AttachInternetGateway
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${Env}-GenAI-NAT
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${Env}-GenAI-Public-RT
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachInternetGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteToNAT:
+    DependsOn:
+      - AttachInternetGateway
+      - NATGateway
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "Allow HTTPS outbound traffic for Lambda functions"
+
+  SageMakerEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for SageMaker endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "Allow HTTPS outbound traffic for SageMaker"
+
+
+###################################
+#
+# Layers
+#
+###################################
+
+  NltkDataLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub ${Env}-GenAiStateMachine-NltkDataLayer
+      Description: Layer for NLTK data
+      ContentUri: ../functions/genai/extractive_summarization/nltk_data/
+      CompatibleRuntimes:
+        - python3.11
+
+###################################
+#
+# State Machine
+#
+###################################
+
+  GenAiStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Description: State machine for text extraction and summarization
+    Properties:
+      Name: !Sub ${Env}-GenAiStateMachine
+      DefinitionUri: ../statemachines/sm_gen_ai.asl.json
+      DefinitionSubstitutions:
+        SQSQueueURL: !Ref FileProcessingQueue
+        ExtractiveSummarizationFunctionArn: !GetAtt ExtractiveSummarizationFunction.Arn
+        AbstractiveSummarizationFunctionArn: !GetAtt AbstractiveSummarizationFunction.Arn
+        GeneratedTitleFunctionArn: !GetAtt GeneratedTitleFunction.Arn
+        AuthorExtractionFunctionArn: !GetAtt AuthorExtractionFunction.Arn
+        SQSBatchReceiveFunctionArn: !GetAtt SQSBatchReceiveFunction.Arn
+        JobCompleteSNSFunctionArn: !GetAtt JobCompleteSNSFunction.Arn
+        DeleteLlmSagemakerEndpointFunctionArn: !GetAtt DeleteLlmSagemakerEndpointFunction.Arn
+        DeleteNerSagemakerEndpointFunctionArn: !GetAtt DeleteNerSagemakerEndpointFunction.Arn
+        AWSPartition: !Ref "AWS::Partition"
+      Role: !GetAtt GenAiStateMachineRole.Arn
+
+###################################
+#
+# KMS Definitions
+#
+###################################
+  KMSKeyLambda:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for Lambda environment variables
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+
+  KMSKeySQS:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for SQS
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+
+###################################
+#
+# SQS Definitions
+#
+###################################
+
+  FileProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Env}-FileProcessing-Queue"
+      VisibilityTimeout: 3600
+      KmsMasterKeyId: !GetAtt KMSKeySQS.Arn
+
+  FileProcessingQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties: 
+        PolicyDocument:
+          Statement:
+            - Effect: "Deny"
+              Action: "sqs:*"
+              Condition:
+                Bool:
+                  aws:SecureTransport: "false"
+              Principal: { "AWS": "*" }
+              Resource:
+                Fn::GetAtt: [
+                  "FileProcessingQueue",
+                  "Arn"
+                ]
+        Queues:
+          - !Ref FileProcessingQueue
+
+  DLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Env}-DLQ
+      VisibilityTimeout: 900
+      KmsMasterKeyId: !GetAtt KMSKeySQS.Arn
+
+###################################
+#
+# Policy Definitions
+#
+###################################
+
+  DynamoDBPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-DynamoDBPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'dynamodb:BatchGetItem'
+              - 'dynamodb:ConditionCheckItem'
+              - 'dynamodb:DescribeTable'
+              - 'dynamodb:GetItem'
+              - 'dynamodb:GetRecords'
+              - 'dynamodb:GetShardIterator'
+              - 'dynamodb:Query'
+              - 'dynamodb:Scan'
+              - 'dynamodb:BatchWriteItem'
+              - 'dynamodb:DeleteItem'
+              - 'dynamodb:DescribeTable'
+              - 'dynamodb:PutItem'
+              - 'dynamodb:UpdateItem'
+            Resource: !Ref DocumentStateTable
+
+  EC2VPCPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-EC2VPCPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ec2:DescribeNetworkInterfaces'
+              - 'ec2:CreateNetworkInterface'
+              - 'ec2:DeleteNetworkInterface'
+              - 'ec2:DescribeInstances'
+              - 'ec2:AttachNetworkInterface'
+              - 'ec2:DescribeSubnets'
+              - 'ec2:DescribeSecurityGroups'
+              - 'ec2:DescribeVpcs'
+              - 'ec2:DescribeDhcpOptions'
+            Resource: '*'
+
+  SmDescribeEndpointPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-SmDescribeEndpointPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'Sagemaker:DescribeEndpoint'
+            Resource:
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${Env}-${LlmEndpointName}'
+                - LlmEndpointName: !Ref LlmEndpointName
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${Env}-${NerEndpointName}'
+                - NerEndpointName: !Ref NerEndpointName
+
+  PutMessageInSQSPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-PutMessageInSQSPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'sqs:GetQueueAttributes'
+              - 'sqs:GetQueueUrl'
+              - 'sqs:SendMessage'
+            Resource:
+              Fn::GetAtt: [
+                "FileProcessingQueue",
+                "Arn"
+              ]
+
+  GetMessageFromSQSPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-GetMessageFromSQSPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'sqs:ChangeMessageVisibility'
+              - 'sqs:DeleteMessage'
+              - 'sqs:GetQueueAttributes'
+              - 'sqs:GetQueueUrl'
+              - 'sqs:ReceiveMessage'
+            Resource:
+              Fn::GetAtt: [
+                "FileProcessingQueue",
+                "Arn"
+              ]
+
+  ExtractPathsS3ReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-ExtractPathsS3ReadPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:ListObjectsV2'
+              - 's3:ListBucket'
+            Resource:
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:s3:::${ExtractsBucket}'
+                - ExtractsBucket: !Ref ExtractsBucket
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:s3:::${ExtractiveSummaryBucket}'
+                - ExtractiveSummaryBucket: !Ref ExtractiveSummaryBucket
+
+  InvokeLlmEndpointPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-InvokeLlmEndpointPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'sagemaker:InvokeEndpoint'
+            Resource:
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${Env}-${LlmEndpointName}'
+                - LlmEndpointName: !Ref LlmEndpointName
+
+  InvokeNerEndpointPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-InvokeNerEndpointPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'sagemaker:InvokeEndpoint'
+            Resource:
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${Env}-${NerEndpointName}'
+                - NerEndpointName: !Ref NerEndpointName
+
+
+  AbstractiveSummaryS3WritePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-AbstractiveSummaryS3WritePolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:PutObject'
+              - 's3:ListObjectsV2'
+              - 's3:ListBucket'
+              - 's3:GetObject'
+              - 's3:DeleteObject'
+            Resource:
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:s3:::${AbstractiveSummaryBucket}/*'
+                - AbstractiveSummaryBucket: !Ref AbstractiveSummaryBucket
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:s3:::${ExtractiveSummaryBucket}/*'
+                - ExtractiveSummaryBucket: !Ref ExtractiveSummaryBucket
+
+  GeneratedTitleS3WritePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-GeneratedTitleS3WritePolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:PutObject'
+              - 's3:ListObjectsV2'
+              - 's3:ListBucket'
+              - 's3:GetObject'
+              - 's3:DeleteObject'
+            Resource:
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:s3:::${GeneratedTitleBucket}/*'
+                - GeneratedTitleBucket: !Ref GeneratedTitleBucket
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:s3:::${ExtractiveSummaryBucket}/*'
+                - ExtractiveSummaryBucket: !Ref ExtractiveSummaryBucket
+
+  AuthorExtractionS3WritePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-AuthorExtractionS3WritePolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:PutObject'
+              - 's3:ListObjectsV2'
+              - 's3:ListBucket'
+              - 's3:GetObject'
+              - 's3:DeleteObject'
+            Resource:
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:s3:::${AuthorExtractionBucket}/*'
+                - AuthorExtractionBucket: !Ref AuthorExtractionBucket
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:s3:::${ExtractsBucket}/*'
+                - ExtractsBucket: !Ref ExtractsBucket
+
+  ExtractiveSummaryS3Policy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-ExtractiveSummaryS3Policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "s3PutObject"
+            Effect: Allow
+            Action:
+              - 's3:PutObject'
+            Resource:
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:s3:::${ExtractiveSummaryBucket}/*'
+                - ExtractiveSummaryBucket: !Ref ExtractiveSummaryBucket
+          - Sid: "s3GetObject"
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:s3:::${ExtractsBucket}/*'
+                - ExtractsBucket: !Ref ExtractsBucket
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:s3:::${ExtractsBucket}/'
+                - ExtractsBucket: !Ref ExtractsBucket
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:s3:::${ExtractsBucket}'
+                - ExtractsBucket: !Ref ExtractsBucket
+
+  CreateSagemakerModelPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-CreateSagemakerModelPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:GetObject'
+              - 's3:ListBucket'
+            Resource:
+              - !Sub 'arn:aws:s3:::${ModelsBucket}'
+              - !Sub 'arn:aws:s3:::${ModelsBucket}/*'
+
+          - Effect: Allow
+            Action:
+              - 'ecr:BatchCheckLayerAvailability'
+              - 'ecr:GetDownloadUrlForLayer'
+              - 'ecr:BatchGetImage'
+            Resource: !Sub 'arn:aws:ecr:${AWS::Region}:*:repository/*'
+
+          - Effect: Allow
+            Action: 'ecr:GetAuthorizationToken'
+            Resource: '*'
+
+          - Effect: Allow
+            Action:
+              - 'ec2:CreateNetworkInterface'
+              - 'ec2:DeleteNetworkInterface'
+              - 'ec2:DescribeNetworkInterfaces'
+              - 'ec2:DescribeVpcs'
+              - 'ec2:DescribeSubnets'
+              - 'ec2:DescribeSecurityGroups'
+              - "ec2:DescribeDhcpOptions"
+              - "ec2:DeleteNetworkInterfacePermission"
+              - "ec2:DeleteNetworkInterface"
+              - "ec2:CreateNetworkInterfacePermission"
+            Resource: '*'
+
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/*'
+
+  CreateSagemakerEndpointPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-CreateSagemakerEndpointPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "iamGetRole"
+            Effect: Allow
+            Action:
+              - iam:GetRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+          - Sid: "SageMakerCreateModel"
+            Effect: Allow
+            Action:
+              - 'sagemaker:CreateModel'
+              - 'sagemaker:CreateEndpointConfig'
+              - 'sagemaker:CreateEndpoint'
+              - 'sagemaker:DescribeEndpoint'
+              - 'sagemaker:DescribeModel'
+              - 'sagemaker:DescribeEndpointConfig'
+            Resource:
+              - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:model/*'
+              - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/*'
+              - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint-config/*'
+          - Sid: "S3ModelDownload"
+            Effect: Allow
+            Action:
+              - 's3:GetObject'
+            Resource: !Sub 'arn:aws:s3:::${ModelsBucket}/*'
+          - Sid: "iamPassRole"
+            Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource:
+              - Fn::Sub:
+                - 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${CreateSagemakerModelRole}'
+                - CreateSagemakerModelRole: !Ref CreateSagemakerModelRole
+
+  DeleteSagemakerEndpointPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-DeleteSagemakerEndpointPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "iamGetRole"
+            Effect: Allow
+            Action:
+              - iam:GetRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+          - Sid: "SageMakerDeleteEndpoint"
+            Effect: Allow
+            Action:
+              - 'sagemaker:DeleteEndpoint'
+              - 'sagemaker:DeleteEndpointConfig'
+              - 'sagemaker:DeleteModel'
+            Resource:
+              - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/*'
+              - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint-config/*'
+              - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:model/*'
+          - Sid: "SNS"
+            Effect: 'Allow'
+            Action:
+              - 'sns:Publish'
+            Resource: !GetAtt SNSTopicEmailNotification.TopicArn
+
+  TriggerEndpointsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-TriggerEndpointsPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "InvokeFunction"
+            Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
+              - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
+
+  DeleteSagemakerEndpointSNSPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-DeleteSagemakerEndpointSNSPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "iamGetRole"
+            Effect: Allow
+            Action:
+              - iam:GetRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+          - Sid: "SNS"
+            Effect: 'Allow'
+            Action:
+              - 'sns:Publish'
+            Resource: !GetAtt SNSTopicEmailNotification.TopicArn
+
+  GenAiStateMachinePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-GenAiStateMachinePolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'lambda:InvokeFunction'
+            Resource: 
+            - !GetAtt ExtractiveSummarizationFunction.Arn
+            - !GetAtt AbstractiveSummarizationFunction.Arn
+            - !GetAtt GeneratedTitleFunction.Arn
+            - !GetAtt AuthorExtractionFunction.Arn
+            - !GetAtt DeleteLlmSagemakerEndpointFunction.Arn
+            - !GetAtt DeleteNerSagemakerEndpointFunction.Arn
+            - !GetAtt SQSBatchReceiveFunction.Arn
+            - !GetAtt JobCompleteSNSFunction.Arn
+          - Effect: Allow
+            Action:
+              - 'states:StartExecution'
+            Resource:
+            - !Sub arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${Env}-GenAiStateMachine
+
+  StartStateMachinePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-StartStateMachinePolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'states:StartExecution'
+            Resource: !Ref GenAiStateMachine
+
+  SnsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-SnsPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "iamGetRole"
+            Effect: Allow
+            Action:
+              - iam:GetRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+          - Sid: "SNS"
+            Effect: 'Allow'
+            Action:
+              - 'sns:Publish'
+            Resource: !GetAtt SNSTopicEmailNotification.TopicArn
+
+  TriggerPushToQueueLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAiStateMachine-TriggerP2QPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'lambda:InvokeFunction'
+            Resource: !GetAtt PushToQueueFunction.Arn
+
+  DLQPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-DLQ-Policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt DLQ.Arn
+
+  KMSLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAi-KMSLambda-Policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: !GetAtt KMSKeyLambda.Arn
+
+  KMSSQSPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PolicyPrefix}-${Env}-GenAi-KMSSQS-Policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: !GetAtt KMSKeySQS.Arn
+
+###################################
+#
+# Role Definitions
+#
+###################################
+
+  ExtractPathsInS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RolePrefix}-${Env}-GenAiStateMachine-ExtractPathsInS3Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref EC2VPCPolicy
+        - !Ref SmDescribeEndpointPolicy
+        - !Ref ExtractPathsS3ReadPolicy
+        - !Ref StartStateMachinePolicy
+        - !Ref TriggerPushToQueueLambdaPolicy
+        - !Ref DLQPolicy
+        - !Ref KMSLambdaPolicy
+
+  PushToQueueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RolePrefix}-${Env}-GenAiStateMachine-PushToQueue
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref DynamoDBPolicy
+        - !Ref EC2VPCPolicy
+        - !Ref PutMessageInSQSPolicy
+        - !Ref DLQPolicy
+        - !Ref KMSLambdaPolicy
+        - !Ref KMSSQSPolicy
+
+  SQSBatchReceiveRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RolePrefix}-${Env}-GenAi-SQSBatchReceiveRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref EC2VPCPolicy
+        - !Ref GetMessageFromSQSPolicy
+        - !Ref DLQPolicy
+        - !Ref KMSLambdaPolicy
+        - !Ref KMSSQSPolicy
+
+  AbstractiveSummarizationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RolePrefix}-${Env}-GenAi-AbstractiveSummarizationRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref EC2VPCPolicy
+        - !Ref ExtractPathsS3ReadPolicy
+        - !Ref InvokeLlmEndpointPolicy
+        - !Ref AbstractiveSummaryS3WritePolicy
+        - !Ref DLQPolicy
+        - !Ref KMSLambdaPolicy
+
+  GeneratedTitleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RolePrefix}-${Env}-GenAi-GeneratedTitleRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref EC2VPCPolicy
+        - !Ref ExtractPathsS3ReadPolicy
+        - !Ref InvokeLlmEndpointPolicy
+        - !Ref GeneratedTitleS3WritePolicy
+        - !Ref DLQPolicy
+        - !Ref KMSLambdaPolicy
+
+  AuthorExtractionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RolePrefix}-${Env}-GenAi-AuthorExtractionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref EC2VPCPolicy
+        - !Ref ExtractPathsS3ReadPolicy
+        - !Ref InvokeNerEndpointPolicy
+        - !Ref AuthorExtractionS3WritePolicy
+        - !Ref DLQPolicy
+        - !Ref KMSLambdaPolicy
+
+  ExtractiveSummarizationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RolePrefix}-${Env}-GenAi-ExtractiveSummarizationRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref EC2VPCPolicy
+        - !Ref ExtractiveSummaryS3Policy
+        - !Ref DLQPolicy
+        - !Ref KMSLambdaPolicy
+
+  CreateSagemakerModelRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RolePrefix}-${Env}-GenAi-CreateSagemakerModelRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - sagemaker.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref CreateSagemakerModelPolicy
+        - !Ref DLQPolicy
+        - !Ref KMSLambdaPolicy
+        - !Ref EC2VPCPolicy
+
+  CreateSagemakerEndpointRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RolePrefix}-${Env}-GenAi-CreateSagemakerEndpointRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref CreateSagemakerEndpointPolicy
+        - !Ref DLQPolicy
+        - !Ref KMSLambdaPolicy
+        - !Ref EC2VPCPolicy
+
+  DeleteSagemakerEndpointRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RolePrefix}-${Env}-GenAi-DeleteSagemakerEndpointRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref DeleteSagemakerEndpointPolicy
+        - !Ref DLQPolicy
+        - !Ref KMSLambdaPolicy
+        - !Ref EC2VPCPolicy
+
+  TriggerEndpointsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RolePrefix}-${Env}-GenAi-TriggerEndpointsRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref TriggerEndpointsPolicy
+        - !Ref DLQPolicy
+        - !Ref KMSLambdaPolicy
+        - !Ref EC2VPCPolicy
+ 
+  DeleteSagemakerEndpointSNSRole:
+   Type: AWS::IAM::Role
+   Properties:
+     RoleName: !Sub ${RolePrefix}-${Env}-GenAi-DeleteSagemakerEndpointSNSRole
+     AssumeRolePolicyDocument:
+       Version: '2012-10-17'
+       Statement:
+         - Effect: Allow
+           Principal:
+             Service:
+               - lambda.amazonaws.com
+           Action:
+             - 'sts:AssumeRole'
+     ManagedPolicyArns:
+       - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+       - !Ref DeleteSagemakerEndpointSNSPolicy
+       - !Ref DLQPolicy
+       - !Ref KMSLambdaPolicy
+       - !Ref EC2VPCPolicy
+
+  GenAiStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RolePrefix}-${Env}-GenAi-StateMachineRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref GenAiStateMachinePolicy
+        - !Ref GetMessageFromSQSPolicy
+        - !Ref DLQPolicy
+        - !Ref KMSLambdaPolicy
+        - !Ref EC2VPCPolicy
+
+  SnsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RolePrefix}-${Env}-GenAi-SnsRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref SnsPolicy
+        - !Ref DLQPolicy
+        - !Ref KMSLambdaPolicy
+        - !Ref EC2VPCPolicy
+
+###################################
+#
+# Function Definitions
+#
+###################################
+
+  SQSBatchReceiveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Env}-GenAiStateMachine-SQSBatchReceive
+      MemorySize: 4096
+      CodeUri: ../functions/shared/sqs_batch_receive
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Timeout: 900
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          FILE_SQS_QUEUE_NAME: !Ref FileProcessingQueue
+          MAX_CONCURRENCY: !Ref MaxConcurrentStateMachines
+      KmsKeyArn: !GetAtt KMSKeyLambda.Arn
+      Role: !GetAtt SQSBatchReceiveRole.Arn
+      Architectures:
+      - x86_64
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+      
+
+  AbstractiveSummarizationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Env}-GenAiStateMachine-AbstractiveSummarizationFunction
+      CodeUri: ../functions/genai/abstractive_summarization/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Timeout: 900
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          OUTPUT_BUCKET: !Ref AbstractiveSummaryBucket
+          EXTRACTIVE_SUMMARY_BUCKET: !Ref ExtractiveSummaryBucket
+          ENDPOINT_NAME:
+            Ref: LlmEndpointName
+      KmsKeyArn: !GetAtt KMSKeyLambda.Arn
+      Role: !GetAtt AbstractiveSummarizationRole.Arn
+      Architectures:
+      - x86_64
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+
+  GeneratedTitleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Env}-GenAiStateMachine-GeneratedTitleFunction
+      CodeUri: ../functions/genai/generated_title/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Timeout: 900
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          OUTPUT_BUCKET: !Ref GeneratedTitleBucket
+          EXTRACTIVE_SUMMARY_BUCKET: !Ref ExtractiveSummaryBucket
+          ENDPOINT_NAME:
+            Ref: LlmEndpointName
+      KmsKeyArn: !GetAtt KMSKeyLambda.Arn
+      Role: !GetAtt GeneratedTitleRole.Arn
+      Architectures:
+      - x86_64
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+
+  AuthorExtractionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Env}-GenAiStateMachine-AuthorExtractionFunction
+      MemorySize: 4096
+      CodeUri: ../functions/genai/author_extraction/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Timeout: 900
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          OUTPUT_BUCKET: !Ref AuthorExtractionBucket
+          EXTRACTS_BUCKET: !Ref ExtractsBucket
+          ENDPOINT_NAME:
+            Ref: NerEndpointName
+      KmsKeyArn: !GetAtt KMSKeyLambda.Arn
+      Role: !GetAtt AuthorExtractionRole.Arn
+      Architectures:
+      - x86_64
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+
+  ExtractiveSummarizationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Env}-GenAiStateMachine-ExtractiveSummarizationFunction
+      CodeUri: ../functions/genai/extractive_summarization/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      MemorySize: 500
+      Timeout: 900
+      Environment:
+        Variables:
+          EXTRACTS_BUCKET: !Ref ExtractsBucket
+          NLTK_DATA: /var/task/nltk_data
+          OUTPUT_BUCKET: !Ref ExtractiveSummaryBucket
+      KmsKeyArn: !GetAtt KMSKeyLambda.Arn
+      Layers:
+        - !Ref NltkDataLayer
+      Role:  !GetAtt ExtractiveSummarizationRole.Arn
+      Architectures:
+      - x86_64
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+
+  ExtractPathsInS3Function:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Env}-GenAiStateMachine-ExtractPathsInS3Function
+      CodeUri: ../functions/shared/extract_paths_in_s3/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      MemorySize: 8000
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          CONTAINS_BUCKET: !Ref ExtractsBucket
+          DOES_NOT_CONTAIN_BUCKET: !Ref ExtractiveSummaryBucket
+          CHECK_LLM_UP: "True"
+          LLM_ENDPOINT_NAME:
+            Ref: LlmEndpointName
+          NER_ENDPOINT_NAME:
+            Ref: NerEndpointName
+          GEN_AI_STATE_MACHINE_ARN: !Ref GenAiStateMachine
+          PUSH_TO_QUEUE_LAMBDA: !Ref PushToQueueFunction
+          BATCH_SIZE: 100
+      KmsKeyArn: !GetAtt KMSKeyLambda.Arn
+      Role:  !GetAtt ExtractPathsInS3Role.Arn
+      Timeout: 900
+      Architectures:
+      - x86_64
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+
+  PushToQueueFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Env}-GenAiStateMachine-PushToQueueFunction
+      CodeUri: ../functions/shared/push_to_queue/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Environment:
+        Variables:
+          FILE_SQS_QUEUE_NAME:
+            Ref: FileProcessingQueue
+          DOC_DDB_STATE_TABLE: !Select [1, !Split ['/', !Ref "DocumentStateTable"]]
+      KmsKeyArn: !GetAtt KMSKeyLambda.Arn
+      Role:  !GetAtt PushToQueueRole.Arn
+      Timeout: 900
+      Architectures:
+      - x86_64
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+
+  CreateLlmSagemakerEndpointFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Env}-GenAiStateMachine-CreateSagemakerLlmEndpointFunction
+      CodeUri: ../functions/shared/create_sagemaker_endpoint/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Timeout: 600
+      Role:  !GetAtt CreateSagemakerEndpointRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          MODEL_PATHS:
+            Ref: ModelS3Paths
+          MODEL_NAME:
+            Ref: LlmModelName
+          ENDPOINT_NAME:
+            Ref: LlmEndpointName
+          ENDPOINT_CONFIG_NAME:
+            Ref: LlmEndpointConfigName
+          LLM_WEIGHTS_BUCKET: !Ref ModelsBucket
+          CREATE_MODEL_ROLE_ARN: !GetAtt CreateSagemakerModelRole.Arn
+          AWS_REGION_NAME:
+            Ref: AWS::Region
+          DLC_ACCOUNTS_BY_REGION:
+            Ref: DlcAccountsByRegion
+          MODEL_IMAGES:
+            Ref: ModelImages
+          MODEL_INSTANCE_TYPES:
+            Ref: ModelInstanceTypes
+          MODEL_TYPE: llm
+          SUBNETS: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+          SECURITY_GROUPS: !Ref SageMakerEndpointSecurityGroup
+      KmsKeyArn: !GetAtt KMSKeyLambda.Arn       
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+
+  CreateNerSagemakerEndpointFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Env}-GenAiStateMachine-CreateSagemakerNerEndpointFunction
+      CodeUri: ../functions/shared/create_sagemaker_endpoint/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Timeout: 600
+      Role:  !GetAtt CreateSagemakerEndpointRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          MODEL_PATHS:
+            Ref: ModelS3Paths
+          MODEL_NAME:
+            Ref: NerModelName
+          ENDPOINT_NAME:
+            Ref: NerEndpointName
+          ENDPOINT_CONFIG_NAME:
+            Ref: NerEndpointConfigName
+          LLM_WEIGHTS_BUCKET: !Ref ModelsBucket
+          CREATE_MODEL_ROLE_ARN: !GetAtt CreateSagemakerModelRole.Arn
+          AWS_REGION_NAME:
+            Ref: AWS::Region
+          DLC_ACCOUNTS_BY_REGION:
+            Ref: DlcAccountsByRegion
+          MODEL_IMAGES:
+            Ref: ModelImages
+          MODEL_INSTANCE_TYPES:
+            Ref: ModelInstanceTypes
+          MODEL_TYPE: ner
+          SUBNETS: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+          SECURITY_GROUPS: !Ref SageMakerEndpointSecurityGroup
+      KmsKeyArn: !GetAtt KMSKeyLambda.Arn       
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+
+  TriggerEndpointsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Env}-GenAiStateMachine-TriggerEndpointsFunction
+      CodeUri: ../functions/shared/trigger_endpoints/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Timeout: 600
+      Role:  !GetAtt TriggerEndpointsRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          LLM_LAMBDA: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${CreateLlmSagemakerEndpointFunction}
+          NER_LAMBDA: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${CreateNerSagemakerEndpointFunction}
+      KmsKeyArn: !GetAtt KMSKeyLambda.Arn       
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+
+  ExtractPathsEndpointEventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - "aws.sagemaker"
+        detail-type:
+          - "SageMaker Endpoint State Change"
+        detail:
+          EndpointStatus:
+            - "IN_SERVICE"
+          EndpointName:
+            - !Sub ${Env}-${LlmEndpointName}
+            - !Sub ${Env}-${NerEndpointName}
+      Targets:
+        - Arn: !GetAtt ExtractPathsInS3Function.Arn
+          Id: "ExtractPathsInS3Function"
+    
+  EventBridgeExtractPathsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ExtractPathsInS3Function.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+
+  DeleteLlmSagemakerEndpointFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Env}-GenAiStateMachine-DeleteLlmSagemakerEndpointFunction
+      CodeUri: ../functions/shared/delete_sagemaker_endpoint/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Role:  !GetAtt DeleteSagemakerEndpointRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Timeout: 600
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          MODEL_NAME:
+            Ref: LlmModelName
+          ENDPOINT_NAME:
+            Ref: LlmEndpointName
+          ENDPOINT_CONFIG_NAME:
+            Ref: LlmEndpointConfigName
+          SNS_TOPIC_ARN: !GetAtt SNSTopicEmailNotification.TopicArn
+      KmsKeyArn: !GetAtt KMSKeyLambda.Arn
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !Ref SNSTopicEmailNotification       
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+
+  DeleteNerSagemakerEndpointFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Env}-GenAiStateMachine-DeleteNerSagemakerEndpointFunction
+      CodeUri: ../functions/shared/delete_sagemaker_endpoint/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Role:  !GetAtt DeleteSagemakerEndpointRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Timeout: 600
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          MODEL_NAME:
+            Ref: NerModelName
+          ENDPOINT_NAME:
+            Ref: NerEndpointName
+          ENDPOINT_CONFIG_NAME:
+            Ref: NerEndpointConfigName
+          SNS_TOPIC_ARN: !GetAtt SNSTopicEmailNotification.TopicArn
+      KmsKeyArn: !GetAtt KMSKeyLambda.Arn
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !Ref SNSTopicEmailNotification       
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+
+  SNSTopicEmailNotification:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Email Notification To Users
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  JobCompleteSNSFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Env}-GenAiStateMachine-JobCompleteSNSFunction
+      CodeUri: ../functions/shared/sns/
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt SnsRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Timeout: 600
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          SNS_TOPIC_ARN: !GetAtt SNSTopicEmailNotification.TopicArn
+      KmsKeyArn: !GetAtt KMSKeyLambda.Arn
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !Ref SNSTopicEmailNotification       
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+
+  LlmGpuUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Env}-${LlmEndpointName}-LowGPUUtilization
+      AlarmDescription: LLM GPU utilization is low. This could mean that the endpoint is unused. Please destroy if necessary.
+      MetricName: GPUUtilization
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: EndpointName
+          Value: !Sub ${Env}-${LlmEndpointName}
+        - Name: VariantName
+          Value: !Sub ${Env}-${LlmModelName}-Variant
+      Namespace: /aws/sagemaker/Endpoints
+      EvaluationPeriods: 1
+      Period: 600
+      Statistic: Average
+      Threshold: 0.1
+      TreatMissingData: ignore
+      ActionsEnabled: true
+      AlarmActions:
+        - !GetAtt SNSTopicEmailNotification.TopicArn
+
+  SageMakerEndpointDeletionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "EventBridge rule to capture SageMaker endpoint deletion"
+      EventPattern:
+        source:
+          - "aws.sagemaker"
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventName:
+            - "DeleteEndpoint"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DeleteLlmSagemakerEndpointFunction.Arn
+          Id: DeleteLlmSagemakerEndpointFunction
+        - Arn: !GetAtt DeleteNerSagemakerEndpointFunction.Arn
+          Id: DeleteNerSagemakerEndpointFunction
+
+Outputs:
+  GenAiStateMachineArn:
+    Description: Gen AI State machine ARN
+    Value: !Ref GenAiStateMachine
+
+Globals:
+  Function:
+    Tracing: Active
+  Api:
+    TracingEnabled: true

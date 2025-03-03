@@ -1,0 +1,249 @@
+{
+  "Comment": "Gen AI Step Function",
+  "StartAt": "FetchFromSQS",
+  "States": {
+    "FetchFromSQS": {
+      "Type": "Task",
+      "Resource": "${SQSBatchReceiveFunctionArn}",
+      "Next": "Are there messages to process?",
+      "ResultSelector": {
+        "Messages.$": "$.Messages",
+        "MessagesLength.$": "States.ArrayLength($.Messages)"
+      }
+    },
+    "Are there messages to process?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Not": {
+            "Variable": "$.Messages",
+            "IsPresent": true
+          },
+          "Next": "JobCompleteSNS"
+        },
+        {
+          "Variable": "$.MessagesLength",
+          "NumericLessThanEquals": 0,
+          "Next": "JobCompleteSNS"
+        }
+      ],
+      "Default": "Process Messages"
+    },
+    "Process Messages": {
+      "Type": "Map",
+      "Next": "FetchFromSQS",
+      "ItemsPath": "$.Messages",
+      "ItemSelector": {
+        "MessageNumber.$": "$$.Map.Item.Index",
+        "MessageDetails.$": "$$.Map.Item.Value",
+        "body.$": "$$.Map.Item.Value.Body"
+      },
+      "ItemProcessor": {
+        "StartAt": "ExtractiveSummarization",
+        "States": {
+          "ExtractiveSummarization": {
+            "Type": "Task",
+            "Resource": "${ExtractiveSummarizationFunctionArn}",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 15,
+                "MaxAttempts": 5,
+                "BackoffRate": 1.5
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "SendToDLQ",
+                "ResultPath": null
+              }
+            ],
+            "Next": "GeneratedTitle"
+          },
+          "GeneratedTitle": {
+            "Type": "Task",
+            "Resource": "${GeneratedTitleFunctionArn}",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 15,
+                "MaxAttempts": 5,
+                "BackoffRate": 1.5
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "SendToDLQ",
+                "ResultPath": null
+              }
+            ],
+            "Next": "AbstractiveSummarization"
+          },
+          "AbstractiveSummarization": {
+            "Type": "Task",
+            "Resource": "${AbstractiveSummarizationFunctionArn}",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 15,
+                "MaxAttempts": 5,
+                "BackoffRate": 1.5
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "SendToDLQ",
+                "ResultPath": null
+              }
+            ],
+            "Next": "AuthorExtraction"
+          },
+          "AuthorExtraction": {
+            "Type": "Task",
+            "Resource": "${AuthorExtractionFunctionArn}",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 15,
+                "MaxAttempts": 5,
+                "BackoffRate": 1.5
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "SendToDLQ",
+                "ResultPath": null
+              }
+            ],
+            "Next": "DeleteFromSQS"      
+          },
+          "DeleteFromSQS": {
+            "Type": "Task",
+            "Resource": "arn:${AWSPartition}:states:::aws-sdk:sqs:deleteMessage",
+            "InputPath": "$.MessageDetails",
+            "ResultPath": null,
+            "Parameters": {
+              "QueueUrl": "${SQSQueueURL}",
+              "ReceiptHandle.$": "$.ReceiptHandle"
+            },
+            "End": true
+          },
+          "SendToDLQ": {
+            "Type": "Task",
+            "Resource": "arn:${AWSPartition}:states:::aws-sdk:sqs:deleteMessage",
+            "InputPath": "$.MessageDetails",
+            "ResultPath": null,
+            "Parameters": {
+              "QueueUrl": "${SQSQueueURL}",
+              "ReceiptHandle.$": "$.ReceiptHandle"
+            },
+            "End": true
+          }
+        },
+        "ProcessorConfig": {
+          "Mode": "DISTRIBUTED",
+          "ExecutionType": "EXPRESS"
+        }
+      },
+      "Label": "ProcessMessages",
+      "MaxConcurrency": 1000,
+      "ToleratedFailurePercentage": 0
+    },
+    "JobCompleteSNS": {
+      "Type": "Task",
+      "Resource": "${JobCompleteSNSFunctionArn}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 15,
+          "MaxAttempts": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "DeleteLlmSmEndpoint",
+          "ResultPath": null
+        }
+      ],
+      "Next": "DeleteLlmSmEndpoint"
+    },
+    "DeleteLlmSmEndpoint": {
+      "Type": "Task",
+      "Resource": "${DeleteLlmSagemakerEndpointFunctionArn}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 15,
+          "MaxAttempts": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "DeleteNerSmEndpoint",
+          "ResultPath": null
+        }
+      ],
+      "Next": "DeleteNerSmEndpoint"
+    },
+    "DeleteNerSmEndpoint": {
+      "Type": "Task",
+      "Resource": "${DeleteNerSagemakerEndpointFunctionArn}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 15,
+          "MaxAttempts": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Finish",
+          "ResultPath": null
+        }
+      ],
+      "Next": "Finish"
+    },
+    "Finish": {
+      "Type": "Succeed"
+    }
+  }
+}
+

@@ -1,0 +1,534 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Data Stack for documents
+
+Parameters:
+  Env:
+    Description: Environment Name
+    Type: String
+    Default: dev
+
+  ExtractsBucketName:
+    Description: Bucket where the extracts from the raw documents are stored
+    Type: String
+    Default: extracts
+
+  ExtractiveSummaryBucketName:
+    Description: Bucket where the extractive summaries are stored
+    Type: String
+    Default: extractive-summary
+
+  AbstractiveSummaryBucketName:
+    Description: Bucket where the abstractive summaries are stored
+    Type: String
+    Default: abstractive-summary
+
+  GeneratedTitleBucketName:
+    Description: Bucket where the generated titles are stored
+    Type: String
+    Default: generated-title
+
+  AuthorExtractionBucketName:
+    Description: Bucket where the extracted author names are stored
+    Type: String
+    Default: author-extraction
+
+  ModelsBucketName:
+    Description: Bucket where the llm weights are stored
+    Type: String
+    Default: model-weights
+
+  S3AccessLogsBucketName:
+    Description: Bucket where S3 access logs are stored
+    Type: String
+    Default: access-logs
+
+  DocumentStateTableName:
+    Description: Table to store the status of a document
+    Type: String
+    Default: document-state-table
+
+Resources:
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref AWS::AccountId
+          - !Ref AWS::Region
+          - !Ref Env
+          - 'logs'
+          - !Select
+            - 0
+            - !Split
+              - '-'
+              - !Select
+                - 2
+                - !Split
+                  - /
+                  - !Ref AWS::StackId
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ExtractsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref AWS::AccountId
+          - !Ref AWS::Region
+          - !Ref Env
+          - !Ref ExtractsBucketName
+          - !Select
+            - 0
+            - !Split
+              - '-'
+              - !Select
+                - 2
+                - !Split
+                  - /
+                  - !Ref AWS::StackId
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: 'logs/'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ExtractiveSummaryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref AWS::AccountId
+          - !Ref AWS::Region
+          - !Ref Env
+          - !Ref ExtractiveSummaryBucketName
+          - !Select
+            - 0
+            - !Split
+              - '-'
+              - !Select
+                - 2
+                - !Split
+                  - /
+                  - !Ref AWS::StackId
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: 'logs/'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  AbstractiveSummaryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref AWS::AccountId
+          - !Ref AWS::Region
+          - !Ref Env
+          - !Ref AbstractiveSummaryBucketName
+          - !Select
+            - 0
+            - !Split
+              - '-'
+              - !Select
+                - 2
+                - !Split
+                  - /
+                  - !Ref AWS::StackId
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: 'logs/'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  GeneratedTitleBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref AWS::AccountId
+          - !Ref AWS::Region
+          - !Ref Env
+          - !Ref GeneratedTitleBucketName
+          - !Select
+            - 0
+            - !Split
+              - '-'
+              - !Select
+                - 2
+                - !Split
+                  - /
+                  - !Ref AWS::StackId
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: 'logs/'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  AuthorExtractionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref AWS::AccountId
+          - !Ref AWS::Region
+          - !Ref Env
+          - !Ref AuthorExtractionBucketName
+          - !Select
+            - 0
+            - !Split
+              - '-'
+              - !Select
+                - 2
+                - !Split
+                  - /
+                  - !Ref AWS::StackId
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: 'logs/'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  S3AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref AWS::AccountId
+          - !Ref AWS::Region
+          - !Ref Env
+          - !Ref S3AccessLogsBucketName
+          - !Select
+            - 0
+            - !Split
+              - '-'
+              - !Select
+                - 2
+                - !Split
+                  - /
+                  - !Ref AWS::StackId
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: 'logs/'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ModelsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref AWS::AccountId
+          - !Ref AWS::Region
+          - !Ref Env
+          - !Ref ModelsBucketName
+          - !Select
+            - 0
+            - !Split
+              - '-'
+              - !Select
+                - 2
+                - !Split
+                  - /
+                  - !Ref AWS::StackId
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: 'logs/'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ForceSSLOnlyAccess
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub arn:aws:s3:::${LoggingBucket}/*
+              - !Sub arn:aws:s3:::${LoggingBucket}
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: AllowS3LogDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${LoggingBucket}/*
+
+
+  ExtractsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ExtractsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ForceSSLOnlyAccess
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub arn:aws:s3:::${ExtractsBucket}/*
+              - !Sub arn:aws:s3:::${ExtractsBucket}
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  ExtractiveSummaryBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ExtractiveSummaryBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ForceSSLOnlyAccess
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub arn:aws:s3:::${ExtractiveSummaryBucket}/*
+              - !Sub arn:aws:s3:::${ExtractiveSummaryBucket}
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  AbstractiveSummaryBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AbstractiveSummaryBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ForceSSLOnlyAccess
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub arn:aws:s3:::${AbstractiveSummaryBucket}/*
+              - !Sub arn:aws:s3:::${AbstractiveSummaryBucket}
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  GeneratedTitleBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref GeneratedTitleBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ForceSSLOnlyAccess
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub arn:aws:s3:::${GeneratedTitleBucket}/*
+              - !Sub arn:aws:s3:::${GeneratedTitleBucket}
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  AuthorExtractionBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AuthorExtractionBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ForceSSLOnlyAccess
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub arn:aws:s3:::${AuthorExtractionBucket}/*
+              - !Sub arn:aws:s3:::${AuthorExtractionBucket}
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  S3AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ForceSSLOnlyAccess
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub arn:aws:s3:::${S3AccessLogsBucket}/*
+              - !Sub arn:aws:s3:::${S3AccessLogsBucket}
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  ModelsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ModelsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ForceSSLOnlyAccess
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub arn:aws:s3:::${ModelsBucket}/*
+              - !Sub arn:aws:s3:::${ModelsBucket}
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+
+  DocumentStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Join
+      - '-'
+      - - !Ref AWS::AccountId
+        - !Ref AWS::Region
+        - !Ref Env
+        - !Ref DocumentStateTableName
+        - !Select
+          - 0
+          - !Split
+            - '-'
+            - !Select
+              - 2
+              - !Split
+                - /
+                - !Ref AWS::StackId
+      AttributeDefinitions:
+        - AttributeName: s3_path
+          AttributeType: S
+      KeySchema:
+        - AttributeName: s3_path
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+
+Outputs:
+  ExtractsBucket:
+    Value: !Ref ExtractsBucket
+    Export:
+      Name: !Sub ${Env}-ExtractsBucket
+
+  ExtractiveSummaryBucket:
+    Value: !Ref ExtractiveSummaryBucket
+    Export:
+      Name: !Sub ${Env}-ExtractiveSummaryBucket
+
+  AbstractiveSummaryBucket:
+    Value: !Ref AbstractiveSummaryBucket
+    Export:
+      Name: !Sub ${Env}-AbstractiveSummaryBucket
+
+  GeneratedTitleBucket:
+    Value: !Ref GeneratedTitleBucket
+    Export:
+      Name: !Sub ${Env}-GeneratedTitleBucket
+
+  AuthorExtractionBucket:
+    Value: !Ref AuthorExtractionBucket
+    Export:
+      Name: !Sub ${Env}-AuthorExtractionBucket
+
+  ModelsBucket:
+    Value: !Ref ModelsBucket
+    Export:
+      Name: !Sub ${Env}-ModelsBucket
+
+  DocumentStateTable:
+    Value: !GetAtt DocumentStateTable.Arn
+    Export:
+      Name: !Sub ${Env}-DocumentStateTable
+
