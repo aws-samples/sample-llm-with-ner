@@ -422,5 +422,6 @@ AuthorExtractionBucket/
  * Jeff Ryan, DevOps Engineer - Amazon Web Services Inc.
  * Michael Massey, Cloud Application Architect - Amazon Web Services Inc.
  * Brian Weston, Cloud Transformation for Mission Science Program Lead - LLNL
+ * [Ian Thompson](https://github.com/irthompson01) - Data Engineer - Enterprise Knowledge
  * Samson Odock, Security Engineer - Amazon Web Services Inc.
  * Kyle Rose, Data Scientist - Amazon Web Services Inc.
